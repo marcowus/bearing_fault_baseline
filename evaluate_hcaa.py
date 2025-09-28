@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import accuracy_score, log_loss
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset, Subset
+from scipy import signal as sp_signal
 
 from config import Config
 from data_loader import get_data_loaders
@@ -21,6 +24,119 @@ from hcaa import (
     calculate_ece,
 )
 from model import SimpleCNN
+
+
+def _has_cwru_dataset(config: Config) -> bool:
+    data_path = config.data_path
+    if data_path.endswith(".mat"):
+        return os.path.exists(data_path)
+    if not os.path.isdir(data_path):
+        return False
+    return any(entry.endswith(".mat") for entry in os.listdir(data_path))
+
+
+class SyntheticBearingDataset(Dataset):
+    """Lightweight synthetic dataset for smoke-testing the HCAA pipeline."""
+
+    def __init__(self, config: Config, samples_per_class: int = 64, seed: int = 0) -> None:
+        self.config = config
+        rng = np.random.default_rng(seed)
+        self.spectrograms = []
+        self.signals = []
+        self.labels = []
+
+        t = np.arange(config.signal_length) / float(config.sampling_rate)
+
+        for label in range(config.num_classes):
+            base_freq = 40.0 * (label + 1)
+            modulation = 0.2 * (label + 1)
+            for _ in range(samples_per_class):
+                amplitude = 1.0 + 0.1 * rng.standard_normal()
+                signal = amplitude * np.sin(2 * np.pi * base_freq * t)
+                signal += 0.3 * np.sin(2 * np.pi * (base_freq + modulation) * t)
+                signal += 0.15 * np.sin(2 * np.pi * (base_freq / 2.0) * t)
+                signal += 0.05 * rng.standard_normal(t.shape)
+                signal = (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+
+                spectrogram = self._to_spectrogram(signal)
+
+                self.signals.append(signal.astype(np.float32))
+                self.spectrograms.append(spectrogram)
+                self.labels.append(label)
+
+    def _to_spectrogram(self, signal: np.ndarray) -> np.ndarray:
+        fs = self.config.sampling_rate
+        _, _, zxx = sp_signal.stft(
+            signal,
+            fs=fs,
+            nperseg=128,
+            noverlap=96,
+            window="hann",
+        )
+        magnitude = 20 * np.log10(np.abs(zxx) + 1e-8)
+        magnitude -= magnitude.min()
+        magnitude /= magnitude.max() + 1e-12
+        return magnitude.astype(np.float32)[None, ...]
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int):
+        spectrogram = torch.from_numpy(self.spectrograms[idx])
+        signal = torch.from_numpy(self.signals[idx])
+        label = int(self.labels[idx])
+        return spectrogram, signal, label
+
+
+def _build_synthetic_loaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    dataset = SyntheticBearingDataset(config)
+    indices = np.arange(len(dataset))
+    labels = np.array(dataset.labels)
+
+    train_idx, test_idx, y_train, y_test = train_test_split(
+        indices,
+        labels,
+        test_size=config.test_ratio,
+        random_state=42,
+        stratify=labels,
+    )
+    val_ratio = config.val_ratio / (config.train_ratio + config.val_ratio)
+    train_idx, val_idx, _, _ = train_test_split(
+        train_idx,
+        y_train,
+        test_size=val_ratio,
+        random_state=42,
+        stratify=y_train,
+    )
+
+    train_loader = DataLoader(
+        Subset(dataset, train_idx),
+        batch_size=config.batch_size,
+        shuffle=True,
+    )
+    val_loader = DataLoader(
+        Subset(dataset, val_idx),
+        batch_size=config.batch_size,
+        shuffle=False,
+    )
+    test_loader = DataLoader(
+        Subset(dataset, test_idx),
+        batch_size=config.batch_size,
+        shuffle=False,
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+def _prepare_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    if _has_cwru_dataset(config):
+        return get_data_loaders(config, return_signal=True)
+
+    print(
+        "CWRU dataset not found at configured path. "
+        "Falling back to a synthetic dataset for smoke testing."
+    )
+    return _build_synthetic_loaders(config)
 
 
 def _prepare_model(config: Config) -> SimpleCNN:
@@ -83,6 +199,17 @@ def _collect_predictions(
             llm_response = llm_arbiter.get_structured_probs(features, probs[idx], bn_probs)
             llm_probs = llm_response.probabilities
 
+            bn_sum = float(np.sum(bn_probs))
+            llm_sum = float(np.sum(llm_probs))
+            if bn_sum > 0:
+                bn_probs = bn_probs / bn_sum
+            else:
+                bn_probs = np.full_like(bn_probs, 1.0 / len(bn_probs))
+            if llm_sum > 0:
+                llm_probs = llm_probs / llm_sum
+            else:
+                llm_probs = np.full_like(llm_probs, 1.0 / len(llm_probs))
+
             labels.append(label)
             cnn_probs_list.append(probs[idx])
             bn_probs_list.append(bn_probs)
@@ -113,8 +240,8 @@ def evaluate():
     bn_engine = FaultDiagnosticEngine()
     llm_arbiter = SiliconFlowLLMArbiter()
 
-    print("Loading dataloaders with raw signal access...")
-    _, val_loader, test_loader = get_data_loaders(config, return_signal=True)
+    print("Preparing dataloaders with raw signal access...")
+    _, val_loader, test_loader = _prepare_dataloaders(config)
 
     print("Loading CNN baseline model...")
     model = _prepare_model(config)
@@ -147,6 +274,10 @@ def evaluate():
     results: Dict[str, Dict[str, float]] = {}
 
     def _evaluate_model(name: str, probs: np.ndarray) -> Dict[str, float]:
+        probs = np.asarray(probs, dtype=np.float64)
+        denom = np.sum(probs, axis=1, keepdims=True)
+        denom[denom == 0] = 1.0
+        probs = probs / denom
         preds = np.argmax(probs, axis=1)
         return {
             "Accuracy": accuracy_score(test_labels, preds),
