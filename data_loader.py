@@ -11,10 +11,11 @@ import matplotlib.pyplot as plt
 class CWRUDataset(Dataset):
     """CWRU轴承数据集加载器"""
 
-    def __init__(self, signals, labels, transform=None):
+    def __init__(self, signals, labels, transform=None, return_signal=False):
         self.signals = signals
         self.labels = labels
         self.transform = transform
+        self.return_signal = return_signal
 
     def __len__(self):
         return len(self.signals)
@@ -28,6 +29,10 @@ class CWRUDataset(Dataset):
 
         if self.transform:
             spectrogram = self.transform(spectrogram)
+
+        if self.return_signal:
+            raw_signal = torch.as_tensor(signal, dtype=torch.float32)
+            return spectrogram, raw_signal, label
 
         return spectrogram, label
 
@@ -123,10 +128,8 @@ def load_cwru_data(data_path):
     print(f"Total samples: {len(signals)}, Labels distribution: {np.bincount(labels)}")
     return np.array(signals), np.array(labels)
 
-    return np.array(signals), np.array(labels)
 
-
-def get_data_loaders(config):
+def get_data_loaders(config, return_signal=False):
     """获取数据加载器"""
     # 加载数据
     signals, labels = load_cwru_data(config.data_path)
@@ -140,9 +143,9 @@ def get_data_loaders(config):
         X_temp, y_temp, test_size=val_size, random_state=42, stratify=y_temp)
 
     # 创建数据集
-    train_dataset = CWRUDataset(X_train, y_train)
-    val_dataset = CWRUDataset(X_val, y_val)
-    test_dataset = CWRUDataset(X_test, y_test)
+    train_dataset = CWRUDataset(X_train, y_train, return_signal=return_signal)
+    val_dataset = CWRUDataset(X_val, y_val, return_signal=return_signal)
+    test_dataset = CWRUDataset(X_test, y_test, return_signal=return_signal)
 
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
@@ -156,7 +159,12 @@ def get_data_loaders(config):
 def visualize_sample(dataloader, config):
     """可视化一个样本，检查数据预处理是否正确"""
     data_iter = iter(dataloader)
-    spectrograms, labels = next(data_iter)
+    batch = next(data_iter)
+
+    if len(batch) == 3:
+        spectrograms, _, labels = batch
+    else:
+        spectrograms, labels = batch
 
     print(f"Spectrogram shape: {spectrograms.shape}")
     print(f"Labels: {labels}")
